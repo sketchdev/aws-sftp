@@ -33,7 +33,8 @@
   "Parameters" : {
     "AmiId" : {
       "Description" : "ID of the Ubuntu AMI to scale",
-      "Type" : "String"
+      "Type" : "String",
+      "Default" : "ami-759bc50a"
     },
 
     "ASGHealthCheckGracePeriod" : {
@@ -470,7 +471,7 @@
                 "# Set up host keys\n",
                 "####################\n",
                 "cd /etc/ssh\n",
-                "aws s3 cp s3://", { "Ref" : "AbbreviatedCompanyName" }, "-", { "Ref" : "AWS::EnvironmentId"}, "-keys/ftp/ . --recursive --exclude \"*\" --include \"ssh_host*\" --region ", { "Ref" : "AWS::Region"}, "\n",
+                "aws s3 cp s3://", { "Ref" : "AbbreviatedCompanyName" }, "-", { "Ref" : "EnvironmentId" }, "-keys/ftp/ . --recursive --exclude \"*\" --include \"ssh_host*\" --region ", { "Ref" : "AWS::Region" }, "\n",
                 "chmod 600 *_key\n",
                 "chmod 644 *_key.pub\n",
 

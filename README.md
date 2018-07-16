@@ -14,9 +14,9 @@ If you don't already have command line access to AWS, please see their [document
 Create some buckets in S3 (remember to replace "yourcompany" in the instructions below!):
 
 ```bash
-aws s3 mb yourcompany-ftp
-aws s3 mb yourcompany-development-software
-aws s3 mb yourcompany-keys
+aws s3 mb s3://yourcompany-ftp
+aws s3 mb s3://yourcompany-development-software
+aws s3 mb s3://yourcompany-keys
 ```
 
 Upload the sample files:
@@ -34,3 +34,12 @@ aws s3 cp ancillary-resources/sample-hostkeys/ s3://yourcompany-keys/ftp/ --recu
 
 ## Launch the Server ##
 Now that the setup is complete, launch the `sftp-setup.template` CloudFormation template in AWS. As previously mentioned, we recommend launching it via the AWS Console if you are unfamiliar with parameterized templates. View the [AWS documentation](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-create-stack.html) for the latest instructions on launching a CloudFormation stack via the console.
+
+## Connect ##
+Once the stack has launched successfully, you should be able to connect to it. Inside this project under `ancillary-resources/sample-users/` is a users.csv file that you've hopefully looked at already before launching this thing. It has sample usernames and passwords (among other things) that get created on the server when it launches. Use one of these users to try and connect to your server.
+
+If you enabled DNS when launching the CloudFormation stack by setting `EnableDNS` to true, you should be able to hit your SFTP server at the domain you specified. However, if you did NOT set `EnableDNS` to true, you can connect to the SFTP server through the Elastic Load Balancer (ELB) created by the template. The DNS record for the ELB can be found by using the following command:
+
+```bash
+aws elb describe-load-balancers --load-balancer-names development-Sftp --query 'LoadBalancerDescriptions[*].{SftpDns:DNSName}' --output text
+```
