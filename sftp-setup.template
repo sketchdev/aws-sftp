@@ -1,0 +1,664 @@
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+
+  "Description" : "Creates an Auto Scaled group of SFTP servers behind a load balancer",
+
+  "Metadata" : {
+    "AWS::CloudFormation::Interface" : {
+      "ParameterGroups" : [
+        {
+          "Label" : { "default" : "Project" },
+          "Parameters" : [ "EnvironmentId" ]
+        },
+        {
+          "Label" : { "default" : "Network" },
+          "Parameters" : [ "PrivateSubnets", "ElbSubnets", "VpcId" ]
+        },
+        {
+          "Label" : { "default" : "Server Details" },
+          "Parameters" : [ "AmiId", "InstanceType", "KeyName" ]
+        },
+        {
+          "Label" : { "default" : "Application Setup" },
+          "Parameters" : [ "InitialInstanceCount", "MinimumInstanceCount", "MaximumInstanceCount", "MinInstancesInService", "OperatorEmail", "SftpBucket" ]
+        },
+        {
+          "Label" : { "default" : "DNS Configuration" },
+          "Parameters" : [ "EnableDNS", "DNSZoneName", "DNSSubnet" ]
+        }
+      ]
+    }
+  },
+
+  "Parameters" : {
+    "AmiId" : {
+      "Description" : "ID of the Ubuntu AMI to scale",
+      "Type" : "String"
+    },
+
+    "ASGHealthCheckGracePeriod" : {
+      "Description" : "Set the healthcheck grace period before the first healthcheck for the ELB ASG",
+      "Type" : "String",
+      "Default" : "300"
+    },
+
+    "ASGHealthCheckType" : {
+      "Description" : "Set the healthcheck type for the ELB ASG",
+      "Type" : "String",
+      "Default" : "INSTANCE",
+      "AllowedValues" : [ "ELB", "INSTANCE" ],
+      "ConstraintDescription" : "must be ELB or INSTANCE."
+    },
+
+    "KeyName" : {
+      "Description" : "Key Name for ssh access. This should be a valid key pair name",
+      "Type" : "AWS::EC2::KeyPair::KeyName",
+      "Default" : "sftpkey"
+    },
+
+    "EnvironmentId" : {
+      "Description" : "Environment Designation (development, staging, production, etc.)",
+      "Type" : "String",
+      "Default" : "development"
+    },
+
+    "InstanceHealthcheckPort" : {
+      "Description" : "TCP/IP port of the app server for health checks",
+      "Type" : "String",
+      "Default" : "22"
+    },
+
+    "InstanceType" : {
+      "Description" : "EC2 instance type of the SFTP server",
+      "Type" : "String",
+      "Default" : "t2.medium",
+      "AllowedValues" : [
+        "t2.nano",
+        "t2.micro",
+        "t2.small",
+        "t2.medium",
+        "t2.large",
+        "m3.medium",
+        "m3.large",
+        "m4.large",
+        "m4.xlarge"
+      ],
+      "ConstraintDescription" : "must be a valid EC2 instance type."
+    },
+
+    "InitialInstanceCount" : {
+      "Description" : "Number of initial EC2 instances to launch",
+      "Type" : "Number",
+      "Default" : "1"
+    },
+
+    "MaximumInstanceCount" : {
+      "Description" : "Maximum number of EC2 instances to allow in the group",
+      "Type" : "Number",
+      "Default" : "4"
+    },
+
+    "MinimumInstanceCount" : {
+      "Description" : "Minimum number of EC2 instances to allow in the group",
+      "Type" : "Number",
+      "Default" : "1"
+    },
+
+    "MinInstancesInService" : {
+      "Description" : "Mininmum Instances In Service during CloudFormation template update",
+      "Type" : "String",
+      "Default" : "1"
+    },
+
+    "SftpBucket" : {
+      "Description" : "S3 bucket name that the FTP files should be mirrored to",
+      "Type" : "String",
+      "Default" : "yourcompany-ftp"
+    },
+
+    "OperatorEmail" : {
+      "Description" : "Email address to notify if there are any scaling operations",
+      "Type" : "String"
+    },
+
+    "ElbSubnets" : {
+      "Description" : "List of public SubnetIds to launch the load balancer into",
+      "Type" : "List<AWS::EC2::Subnet::Id>"
+    },
+
+    "PrivateSubnets" : {
+      "Description" : "List of private SubnetIds to auto scale and load balance the SFTP server instances to",
+      "Type" : "List<AWS::EC2::Subnet::Id>"
+    },
+
+    "VpcId" : {
+      "Description" : "VpcId to deploy SFTP servers into",
+      "Type" : "AWS::EC2::VPC::Id"
+    },
+
+    "EnableDNS" : {
+      "Description" : "If true, creates a Route53 record that maps DNSSubnet to the SFTP load balancer",
+      "Type" : "String",
+      "Default" : "false",
+      "AllowedValues" : [ "true", "false" ],
+      "ConstraintDescription" : "must be true or false."
+    },
+
+    "DNSSubnet" : {
+      "Description" : "DNS name that will resolve to the SFTP load balancer",
+      "Type" : "String",
+      "Default" : "null"
+    },
+
+    "DNSZoneName" : {
+      "Description" : "The Route53 zone name that will be updated (i.e. yourcompany.com)",
+      "Type" : "String",
+      "Default" : "local"
+    }
+  },
+
+  "Mappings" : {
+    "AZCountByRegion" : {
+      "us-east-1"    : { "ZoneCount" : "4" },
+      "us-west-1"    : { "ZoneCount" : "2" },
+      "us-west-2"    : { "ZoneCount" : "3" }
+    }
+  },
+
+  "Conditions" : {
+    "EnableDNSCondition" : { "Fn::Equals" : [ { "Ref" : "EnableDNS" }, "true" ] },
+    "ASGHealthCheckTypeIsELBCondition" : { "Fn::Equals" : [ { "Ref" : "ASGHealthCheckType" }, "ELB" ] },
+    "ProdEnvironment" :  { "Fn::Equals" : [ { "Ref" : "EnvironmentId" }, "production" ] }
+  },
+
+  "Resources" : {
+
+    "AppAWSLogGroup" : {
+      "Type" : "AWS::Logs::LogGroup",
+      "Properties" : {
+        "LogGroupName" : { "Fn::Join" : [ "", [ { "Ref" : "EnvironmentId" }, "SftpServer" ] ] },
+        "RetentionInDays" : {
+          "Fn::If" : [
+            "ProdEnvironment",
+            545,
+            14
+          ]
+        }
+      }
+    },
+
+    "NotificationTopic" : {
+      "Type" : "AWS::SNS::Topic",
+      "Properties" : {
+        "Subscription" : [
+          {
+            "Endpoint" : { "Ref" : "OperatorEmail" },
+            "Protocol" : "email"
+          }
+        ]
+      }
+    },
+
+    "FtpServerRole" : {
+      "Type" : "AWS::IAM::Role",
+      "Properties" : {
+        "RoleName" : { "Fn::Join" : [ "", [ { "Ref" : "EnvironmentId" }, "FtpRole-", { "Ref" : "AWS::Region" } ] ] },
+        "AssumeRolePolicyDocument" : {
+          "Version" : "2012-10-17",
+          "Statement" : [
+            {
+              "Effect" : "Allow",
+              "Principal" : {
+                "Service" : [ "ec2.amazonaws.com" ]
+              },
+              "Action" : [ "sts:AssumeRole" ]
+            }
+          ]
+        },
+        "Path" : "/system/",
+        "Policies" : [
+          {
+            "PolicyName" : "FtpBucketAccess",
+            "PolicyDocument" : {
+              "Version" : "2012-10-17",
+              "Statement" : [
+                {
+                  "Effect" : "Allow",
+                  "Action" : [
+                    "s3:Get*",
+                    "s3:List*"
+                  ],
+                  "Resource" : [
+                    { "Fn::Join" : [ "", [ "arn:aws:s3:::yourcompany-", { "Ref" : "EnvironmentId" }, "-software/ftp/*" ] ] },
+                    { "Fn::Join" : [ "", [ "arn:aws:s3:::", { "Ref" : "SftpBucket" }, "/*" ] ] }
+                  ]
+                },
+                {
+                  "Effect" : "Allow",
+                  "Action" : [
+                    "s3:ListBucket"
+                  ],
+                  "Resource" : [
+                    { "Fn::Join" : [ "", [ "arn:aws:s3:::yourcompany-", { "Ref" : "EnvironmentId" }, "-software" ] ] },
+                    { "Fn::Join" : [ "", [ "arn:aws:s3:::", { "Ref" : "SftpBucket" } ] ] }
+                  ]
+                },
+                {
+                  "Effect" : "Allow",
+                  "Action" : [
+                    "s3:PutObject",
+                    "s3:PutObjectTagging",
+                    "s3:PutObjectVersionTagging"
+                  ],
+                  "Resource" : [
+                    { "Fn::Join" : [ "", [ "arn:aws:s3:::", { "Ref" : "SftpBucket" }, "*" ] ] }
+                  ]
+                },
+                {
+                  "Effect" : "Allow",
+                  "Action" : [
+                    "s3:DeleteObject"
+                  ],
+                  "Resource" : [
+                    { "Fn::Join" : [ "", [ "arn:aws:s3:::", { "Ref" : "SftpBucket" }, "/*" ] ] }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "PolicyName" : "FtpHostKeyAccess",
+            "PolicyDocument" : {
+              "Version" : "2012-10-17",
+              "Statement" : [
+                {
+                  "Effect" : "Allow",
+                  "Action" : [
+                    "s3:Get*",
+                    "s3:List*"
+                  ],
+                  "Resource" : [
+                    { "Fn::Join" : [ "", [ "arn:aws:s3:::yourcompany-", { "Ref" : "EnvironmentId" }, "-keys/ftp/*" ] ] }
+                  ]
+                },
+                {
+                  "Effect" : "Allow",
+                  "Action" : [
+                    "s3:ListBucket"
+                  ],
+                  "Resource" : [
+                    { "Fn::Join" : [ "", [ "arn:aws:s3:::yourcompany-", { "Ref" : "EnvironmentId" }, "-keys" ] ] },
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+
+    "FtpServerInstanceRole" : {
+      "Type" : "AWS::IAM::InstanceProfile",
+      "DependsOn" : "FtpServerRole",
+      "Properties" : {
+        "Path" : "/system/",
+        "Roles" : [ { "Fn::Join" : [ "", [ { "Ref" : "EnvironmentId" }, "FtpRole-", { "Ref" : "AWS::Region" } ] ] } ]
+      }
+    },
+
+    "BadInstanceAlarm" : {
+      "Type" : "AWS::CloudWatch::Alarm",
+      "Properties" : {
+        "AlarmActions" : [ { "Ref" : "NotificationTopic" } ],
+        "AlarmDescription" : "Sftp Server Bad Instance: Email Notification Sent",
+        "ComparisonOperator" : "GreaterThanThreshold",
+        "Dimensions" : [
+          {
+            "Name" : "LoadBalancerName",
+            "Value" : { "Ref" : "ElasticLoadBalancer" }
+          }
+        ],
+        "EvaluationPeriods" : "1",
+        "MetricName" : "UnHealthyHostCount",
+        "Namespace" : "AWS/ELB",
+        "Period" : "300",
+        "Statistic" : "Average",
+        "Threshold" : "0"
+      }
+    },
+
+    "MaxInstances" : {
+      "Type" : "AWS::CloudWatch::Alarm",
+      "Properties" : {
+        "AlarmActions" : [ { "Ref" : "NotificationTopic" } ],
+        "AlarmDescription" : "Sftp Server Max Instances: **Call Support!**",
+        "ComparisonOperator" : "GreaterThanThreshold",
+        "Dimensions" : [
+          {
+            "Name" : "LoadBalancerName",
+            "Value" : { "Ref" : "ElasticLoadBalancer" }
+          }
+        ],
+        "EvaluationPeriods" : "1",
+        "MetricName" : "HealthyHostCount",
+        "Namespace" : "AWS/ELB",
+        "Period" : "300",
+        "Statistic" : "Average",
+        "Threshold" : { "Ref" : "MaximumInstanceCount" }
+      }
+    },
+
+    "NoHealthyInstances" : {
+      "Type" : "AWS::CloudWatch::Alarm",
+      "Properties" : {
+        "AlarmActions" : [ { "Ref" : "NotificationTopic" } ],
+        "AlarmDescription" : "Sftp Servers Are Down: **Call Support!**",
+        "ComparisonOperator" : "LessThanThreshold",
+        "Dimensions" : [
+          {
+            "Name" : "LoadBalancerName",
+            "Value" : { "Ref" : "ElasticLoadBalancer" }
+          }
+        ],
+        "EvaluationPeriods" : "1",
+        "MetricName" : "HealthyHostCount",
+        "Namespace" : "AWS/ELB",
+        "Period" : "60",
+        "Statistic" : "Average",
+        "Threshold" : "1"
+      }
+    },
+
+    "ElasticLoadBalancer" : {
+      "Type" : "AWS::ElasticLoadBalancing::LoadBalancer",
+      "Properties" : {
+        "LoadBalancerName" : { "Fn::Join" : [ "", [ { "Ref" : "EnvironmentId" }, "-Sftp" ] ] },
+        "ConnectionSettings" : { "IdleTimeout" : 300 },
+        "CrossZone" : "true",
+        "HealthCheck" : {
+          "HealthyThreshold" : "3",
+          "Interval" : "30",
+          "Target" : "TCP:22",
+          "Timeout" : "25",
+          "UnhealthyThreshold" : "5"
+        },
+        "Listeners" : [
+          {
+            "InstancePort" : 22,
+            "LoadBalancerPort" : 22,
+            "Protocol" : "TCP"
+          }
+        ],
+        "Scheme" : "internet-facing",
+        "SecurityGroups" : [ { "Ref" : "LoadBalancerSecurityGroup" } ],
+        "Subnets" : { "Ref" : "ElbSubnets" },
+        "Tags" : [
+          {
+            "Key" : "Name",
+            "Value" : { "Fn::Join" : [ "", [ { "Ref" : "EnvironmentId" }, "-Sftp" ] ] }
+          },
+          {
+            "Key" : "Application",
+            "Value" : "SFTP"
+          },
+          {
+            "Key" : "Environment",
+            "Value" : { "Ref" : "EnvironmentId" }
+          }
+        ]
+      }
+    },
+
+    "LoadBalancerSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Enable SFTP access",
+        "SecurityGroupIngress" : [
+          {
+            "FromPort" : 22,
+            "IpProtocol" : "tcp",
+            "ToPort" : 22,
+            "CidrIp" : "0.0.0.0/0"
+          }
+        ],
+        "VpcId" : { "Ref" : "VpcId" }
+      }
+    },
+
+    "InstanceSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "DependsOn" : "LoadBalancerSecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Enable SFTP access",
+        "SecurityGroupIngress" : [
+          {
+            "FromPort" : 22,
+            "IpProtocol" : "tcp",
+            "SourceSecurityGroupId" : { "Ref" : "LoadBalancerSecurityGroup" },
+            "ToPort" : 22
+          }
+        ],
+        "VpcId" : { "Ref" : "VpcId" }
+      }
+    },
+
+    "LaunchConfig" : {
+      "Type" : "AWS::AutoScaling::LaunchConfiguration",
+      "Properties" : {
+        "ImageId" : { "Ref" : "AmiId" },
+        "IamInstanceProfile" : { "Ref" : "FtpServerInstanceRole" },
+        "InstanceType" : { "Ref" : "InstanceType" },
+        "SecurityGroups" : [ { "Ref" : "InstanceSecurityGroup" } ],
+        "KeyName" : { "Ref" : "KeyName" },
+        "UserData" : {
+          "Fn::Base64" : {
+            "Fn::Join" : [
+              "",
+              [
+                "#!/bin/bash -x\n",
+                "apt-get -y update\n",
+                "apt-get -y install awscli\n",
+                "export AWS_DEFAULT_REGION=", { "Ref" : "AWS::Region"}, "\n",
+
+                "####################\n",
+                "# Set up host keys\n",
+                "####################\n",
+                "cd /etc/ssh\n",
+                "aws s3 cp s3://yourcompany-", { "Ref" : "AWS::EnvironmentId"}, "-keys/ftp/ . --recursive --exclude \"*\" --include \"ssh_host*\" --region ", { "Ref" : "AWS::Region"}, "\n",
+                "chmod 600 *_key\n",
+                "chown root:ssh_keys ssh_host_ed25519_key\n",
+
+                "#################\n",
+                "# Install s3fs\n",
+                "#################\n",
+                "apt-get -y install build-essential libcurl4-openssl-dev libxml2-dev mime-support\n",
+                "apt-get -y install automake autotools-dev g++ git libcurl4-gnutls-dev libfuse-dev libssl-dev libxml2-dev make pkg-config\n",
+                "cd /usr/src/\n",
+                "git clone https://github.com/s3fs-fuse/s3fs-fuse.git\n",
+                "cd s3fs-fuse\n",
+                "./autogen.sh\n",
+                "./configure\n",
+                "make\n",
+                "make install\n",
+
+                "#################\n",
+                "# Setup SFTP\n",
+                "#################\n",
+                "groupadd sftpusers\n",
+                "groupadd sftpsuperusers\n",
+                "sed -i -e 's:Subsystem sftp /usr/lib/openssh/sftp-server:#Subsystem sftp /usr/lib/openssh/sftp-server:g' /etc/ssh/sshd_config\n",
+                "cat <<EOT >> /etc/ssh/sshd_config\n",
+                  "#enable sftp\n",
+                  "Subsystem sftp internal-sftp\n\n",
+
+                  "Match Group sftpusers\n",
+                  "   ChrootDirectory %h #set the home directory\n",
+                  "   ForceCommand internal-sftp\n",
+                  "   X11Forwarding no\n",
+                  "   AllowTCPForwarding no\n",
+                  "   PasswordAuthentication yes\n\n",
+
+                  "Match Group sftpsuperusers\n",
+                  "   ChrootDirectory %h\\.. #set the home directory\n",
+                  "   ForceCommand internal-sftp\n",
+                  "   X11Forwarding no\n",
+                  "   AllowTCPForwarding no\n",
+                  "   PasswordAuthentication yes\n\n",
+                "EOT\n",
+                "service ssh restart\n",
+
+                "cd ~\n",
+                "aws s3 cp s3://yourcompany-", { "Ref" : "EnvironmentId" }, "-software/ftp/user-setup.sh .\n",
+                "chmod 744 ./user-setup.sh\n",
+                "source ./user-setup.sh\n",
+                "aws s3 cp s3://yourcompany-", { "Ref" : "EnvironmentId" }, "-software/ftp/users.csv .\n",
+                "process_users ./users.csv ", { "Ref" : "SftpBucket" }, " ", { "Ref" : "AWS::Region" }, "\n",
+                "rm ./users.csv\n",
+
+                "cfn-signal",
+                  " --exit-code $?",
+                  " --stack ", { "Ref" : "AWS::StackName" },
+                  " --resource ServerAutoScalingGroup",
+                  " --region ", { "Ref" : "AWS::Region" },
+                  "\n",
+
+                "# set up AWS CloudWatch Logs\n",
+                "# Set up the CloudWatch Logs agent config file\n",
+                "mkdir -p /tmp/cwlogs/\n",
+                "cat <<EOT >> /tmp/cwlogs/serviceaccess.conf\n",
+                  "[general]\n",
+                  "state_file= /var/awslogs/agent-state\n\n",
+
+                  "[/var/log/syslog]\n",
+                  "file = /var/log/syslog*\n",
+                  "log_group_name = ", { "Ref" : "EnvironmentId" }, "SftpServer\n",
+                  "log_stream_name = syslog\n",
+                  "datetime_format = %Y-%m-%d %H:%M:%S,%f\n",
+                  "multi_line_start_pattern = {datetime_format}\n\n",
+                "EOT\n",
+                "chmod 644 /tmp/cwlogs/serviceaccess.conf\n",
+
+                "# Get the CloudWatch Logs agent\n",
+                "wget https://s3.amazonaws.com/aws-cloudwatch/downloads/latest/awslogs-agent-setup.py\n",
+
+                "# Install the CloudWatch Logs agent\n",
+                "python awslogs-agent-setup.py -n -r ", { "Ref" : "AWS::Region" }, " -c /tmp/cwlogs/serviceaccess.conf || error_exit 'Failed to run CloudWatch Logs agent setup'\n"
+              ]
+            ]
+          }
+        }
+      }
+    },
+
+    "ServerAutoScalingGroup" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "HealthCheckType" : {
+          "Fn::If" : [
+            "ASGHealthCheckTypeIsELBCondition",
+            { "Ref" : "ASGHealthCheckType" },
+            { "Ref" : "AWS::NoValue" }
+          ]
+        },
+        "HealthCheckGracePeriod" : {
+          "Fn::If" : [
+            "ASGHealthCheckTypeIsELBCondition",
+            { "Ref" : "ASGHealthCheckGracePeriod" },
+            { "Ref" : "AWS::NoValue" }
+          ]
+        },
+        "DesiredCapacity" : { "Ref" : "InitialInstanceCount" },
+        "LaunchConfigurationName" : { "Ref" : "LaunchConfig" },
+        "LoadBalancerNames" : [ { "Ref" : "ElasticLoadBalancer" } ],
+        "MaxSize" : { "Ref" : "MaximumInstanceCount" },
+        "MinSize" : { "Ref" : "MinimumInstanceCount" },
+        "NotificationConfiguration" : {
+          "NotificationTypes" : [
+            "autoscaling:EC2_INSTANCE_LAUNCH",
+            "autoscaling:EC2_INSTANCE_LAUNCH_ERROR",
+            "autoscaling:EC2_INSTANCE_TERMINATE",
+            "autoscaling:EC2_INSTANCE_TERMINATE_ERROR"
+          ],
+          "TopicARN" : { "Ref" : "NotificationTopic" }
+        },
+        "Tags" : [
+          {
+            "Key" : "Name",
+            "PropagateAtLaunch" : "true",
+            "Value" : { "Fn::Join" : [ "", [ { "Ref" : "EnvironmentId" }, "-SftpServer" ] ] }
+          },
+          {
+            "Key" : "Application",
+            "PropagateAtLaunch" : "true",
+            "Value" : "SFTP"
+          },
+          {
+            "Key" : "Environment",
+            "PropagateAtLaunch" : "true",
+            "Value" : { "Ref" : "EnvironmentId" }
+          }
+        ],
+        "TerminationPolicies" : [ "OldestInstance", "Default" ],
+        "VPCZoneIdentifier" : { "Ref" : "PrivateSubnets" }
+      },
+      "UpdatePolicy" : {
+        "AutoScalingRollingUpdate" : {
+          "MaxBatchSize" : "1",
+          "MinInstancesInService" : { "Ref" : "MinInstancesInService" },
+          "PauseTime" : "PT5M0S"
+        }
+      }
+    },
+
+    "ServerScaleDownPolicy" : {
+      "Type" : "AWS::AutoScaling::ScalingPolicy",
+      "Properties" : {
+        "AdjustmentType" : "ChangeInCapacity",
+        "AutoScalingGroupName" : { "Ref" : "ServerAutoScalingGroup" },
+        "Cooldown" : "60",
+        "ScalingAdjustment" : "-1"
+      }
+    },
+
+    "ServerScaleUpPolicy" : {
+      "Type" : "AWS::AutoScaling::ScalingPolicy",
+      "Properties" : {
+        "AdjustmentType" : "ChangeInCapacity",
+        "AutoScalingGroupName" : { "Ref" : "ServerAutoScalingGroup" },
+        "Cooldown" : "300",
+        "ScalingAdjustment" : "1"
+      }
+    },
+
+    "DNSRecord" : {
+      "Type" : "AWS::Route53::RecordSetGroup",
+      "Condition" : "EnableDNSCondition",
+      "Properties" : {
+        "HostedZoneName" : { "Fn::Join" : [ "", [ { "Ref" : "DNSZoneName" }, "." ] ] },
+        "RecordSets" : [ {
+          "Name" : { "Fn::Join" : [ "", [ { "Ref" : "DNSSubnet" }, ".", { "Ref" : "DNSZoneName" }, "." ] ] },
+          "Type" : "A",
+          "AliasTarget" : {
+            "HostedZoneId" : { "Fn::GetAtt" : [ "ElasticLoadBalancer", "CanonicalHostedZoneNameID" ] },
+            "DNSName" : { "Fn::GetAtt" : [ "ElasticLoadBalancer", "DNSName" ] }
+          }
+        } ]
+      }
+    }
+  },
+
+  "Outputs" : {
+    "URL" : {
+      "Description" : "SFTP Elb Endpoint",
+      "Value" : { "Fn::Join" : [ "", [ "sftp://", { "Fn::GetAtt" : [ "ElasticLoadBalancer", "DNSName" ] } ] ] }
+    },
+    "ELBSecurityGroup" : {
+      "Description" : "SecurityGroup Id assigned to the load balancer",
+      "Value" : { "Ref" : "LoadBalancerSecurityGroup" }
+    },
+    "ServerInstanceSecurityGroup" : {
+      "Description" : "SecurityGroup Id assigned to the EC2 instances",
+      "Value" : { "Ref" : "InstanceSecurityGroup" }
+    }
+  }
+}
